@@ -1,229 +1,108 @@
 package ringbuf
 
 import (
-	"encoding/binary"
 	"errors"
-	"fmt"
-	"sync"
 	"sync/atomic"
-	"time"
 )
 
 var (
-	ErrFrameDropped         = errors.New("audio: frame dropped or evicted due to latency backpressure")
-	ErrCorruptFrame         = errors.New("audio: buffer corrupted or invalid frame boundaries")
-	ErrBufferClosed         = errors.New("audio: stream buffer is closed")
-	ErrInvalidPayloadLength = errors.New("audio: incoming payload length does not match configured frame size")
-	ErrOutBufferTooSmall    = errors.New("audio: caller destination buffer smaller than frame payload")
+	ErrBufferFull  = errors.New("ringbuf: buffer full")
+	ErrBufferEmpty = errors.New("ringbuf: buffer empty")
+	ErrDstTooSmall = errors.New("ringbuf: destination slice too small")
 )
-
-// OverflowPolicy defines real-time backpressure behavior.
-type OverflowPolicy int
 
 const (
-	// PolicyRejectNew drops incoming frames when backpressure thresholds are met.
-	PolicyRejectNew OverflowPolicy = iota
-	// PolicyDropOldest discards the oldest head frames to keep conversational latency bounded.
-	PolicyDropOldest
+	CacheLinePad     = 64
+	DefaultFrameSize = 960 // 20ms фрейм при 48kHz PCM/Opus
 )
 
-// HeaderSize is the 16-byte fixed binary envelope:
-// [0..7]   Sequence ID (uint64, monotonic)
-// [8..15]  Ingress Monotonic Timestamp (int64 nanoseconds relative to processOrigin)
-const HeaderSize = 16
-
-var processOrigin = time.Now()
-
-// AudioStreamBuffer provides a Voice-AI audio pipeline with zero-alloc fast paths.
-// Designed for a single-consumer model (e.g., worker feeding an audio sink / ASR stream).
-type AudioStreamBuffer struct {
-	// Metrics: sync/atomic typed fields are automatically 64-bit aligned across 32-bit and 64-bit platforms.
-	acceptedFrames atomic.Uint64
-	droppedFrames  atomic.Uint64
-	evictedFrames  atomic.Uint64
-	gapsDetected   atomic.Uint64
-
-	ring        *RingBuffer
-	policy      OverflowPolicy
-	payloadSize int
-	frameSize   int
-	maxFrames   int // Strict conversational latency ceiling (e.g. 10 frames = 200ms)
-
-	cond   *sync.Cond
-	closed bool
-
-	// Consumer tracking for deterministic sequence gap detection across stream lifecycle
-	expectedNextSeq uint64
-	streamStarted   bool
+// AudioStream представляет lock-free буфер аудиокадров для real-time тракта.
+type AudioStream struct {
+	_pad0     [CacheLinePad]byte
+	head      atomic.Uint64
+	_pad1     [CacheLinePad]byte
+	tail      atomic.Uint64
+	_pad2     [CacheLinePad]byte
+	dropped   atomic.Uint64
+	_pad3     [CacheLinePad]byte
+	mask      uint64
+	frameSize int
+	buffer    []byte
+	_pad4     [CacheLinePad]byte
 }
 
-// NewAudioStreamBuffer initializes the buffer with latency-budget bounding.
-// maxLatencyFrames limits queue depth to prevent buffer-bloat latency in Voice AI (e.g., 200ms = 10 frames).
-func NewAudioStreamBuffer(capacityBytes int, framePayloadBytes int, maxLatencyFrames int, policy OverflowPolicy) (*AudioStreamBuffer, error) {
-	if framePayloadBytes <= 0 {
-		return nil, errors.New("audio: framePayloadBytes must be greater than zero")
+// NewAudioStream создает буфер заданной емкости кадров (округляется вверх до степени двойки).
+func NewAudioStream(capacityFrames int, frameSize int) *AudioStream {
+	if capacityFrames < 2 {
+		capacityFrames = 2
+	}
+	cap := 1
+	for cap < capacityFrames {
+		cap <<= 1
 	}
 
-	totalFrameSize := HeaderSize + framePayloadBytes
-	if capacityBytes < totalFrameSize {
-		return nil, fmt.Errorf("capacity (%d bytes) must hold at least one frame (%d bytes)", capacityBytes, totalFrameSize)
+	return &AudioStream{
+		mask:      uint64(cap - 1),
+		frameSize: frameSize,
+		buffer:    make([]byte, cap*frameSize),
 	}
-
-	maxPossibleFrames := capacityBytes / totalFrameSize
-	if maxLatencyFrames <= 0 || maxLatencyFrames > maxPossibleFrames {
-		maxLatencyFrames = maxPossibleFrames
-	}
-
-	rb, err := New(capacityBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	asb := &AudioStreamBuffer{
-		ring:        rb,
-		policy:      policy,
-		payloadSize: framePayloadBytes,
-		frameSize:   totalFrameSize,
-		maxFrames:   maxLatencyFrames,
-	}
-	asb.cond = sync.NewCond(&rb.mu)
-
-	return asb, nil
 }
 
-// IngestFrame writes an audio frame with an external ingress timestamp.
-// ingressTime must be sampled from a monotonic source (e.g. time.Now() at the socket read boundary).
-func (a *AudioStreamBuffer) IngestFrame(seq uint64, ingressTime time.Time, payload []byte) error {
-	if len(payload) != a.payloadSize {
-		return ErrInvalidPayloadLength
+// PushFrame помещает аудиокадр в буфер.
+// При переполнении перезаписывает старейший кадр (sustained eviction), сохраняя 0 аллокаций.
+func (s *AudioStream) PushFrame(src []byte) bool {
+	if len(src) != s.frameSize {
+		return false
 	}
 
-	a.ring.mu.Lock()
-	defer a.ring.mu.Unlock()
+	head := s.head.Load()
+	tail := s.tail.Load()
 
-	if a.closed {
-		return ErrBufferClosed
+	// Проверка переполнения
+	if head-tail > s.mask {
+		s.tail.Add(1)
+		s.dropped.Add(1)
 	}
 
-	// Initialize sequence anchor on the very first received frame so pre-drain evictions are detected
-	if !a.streamStarted {
-		a.expectedNextSeq = seq
-		a.streamStarted = true
-	}
+	offset := int(head&s.mask) * s.frameSize
+	copy(s.buffer[offset:offset+s.frameSize], src)
 
-	currentBufferedFrames := a.ring.cnt / a.frameSize
-
-	// Latency budget and buffer capacity check
-	hasCapacity := (a.ring.size-a.ring.cnt >= a.frameSize) && (currentBufferedFrames < a.maxFrames)
-	if !hasCapacity {
-		switch a.policy {
-		case PolicyRejectNew:
-			a.droppedFrames.Add(1)
-			return ErrFrameDropped
-
-		case PolicyDropOldest:
-			// Zero-copy eviction: advance ring head pointer directly without memory copies
-			for (a.ring.size-a.ring.cnt < a.frameSize) || (a.ring.cnt/a.frameSize >= a.maxFrames) {
-				discarded := a.ring.discardUnsafe(a.frameSize)
-				if discarded == 0 {
-					break
-				}
-				a.evictedFrames.Add(1)
-			}
-		}
-	}
-
-	// Format 16-byte binary header on the stack (zero heap allocation)
-	var hdr [HeaderSize]byte
-	binary.LittleEndian.PutUint64(hdr[0:8], seq)
-	monoNs := int64(ingressTime.Sub(processOrigin))
-	binary.LittleEndian.PutUint64(hdr[8:16], uint64(monoNs))
-
-	// Contiguous two-slice push with strict length verification
-	nHdr := a.ring.pushUnsafe(hdr[:])
-	if nHdr != HeaderSize {
-		return ErrCorruptFrame
-	}
-
-	nPayload := a.ring.pushUnsafe(payload)
-	if nPayload != a.payloadSize {
-		return ErrCorruptFrame
-	}
-
-	a.acceptedFrames.Add(1)
-	a.cond.Signal()
-	return nil
+	s.head.Add(1)
+	return true
 }
 
-// DrainFrame extracts the next audio chunk into outPayload with sequence gap detection.
-// Returns seqGap = true if eviction or drop created a discontinuity in the stream (including before the first drain).
-func (a *AudioStreamBuffer) DrainFrame(outPayload []byte, blocking bool) (seq uint64, latency time.Duration, seqGap bool, err error) {
-	if len(outPayload) < a.payloadSize {
-		return 0, 0, false, ErrOutBufferTooSmall
+// DrainFrame извлекает старейший аудиокадр в переданный буфер dst.
+// Гарантирует нулевые аллокации (0 B/op, 0 allocs/op).
+func (s *AudioStream) DrainFrame(dst []byte) (int, bool) {
+	if len(dst) < s.frameSize {
+		return 0, false
 	}
 
-	a.ring.mu.Lock()
-	defer a.ring.mu.Unlock()
+	tail := s.tail.Load()
+	head := s.head.Load()
 
-	for a.ring.cnt < a.frameSize {
-		if a.closed {
-			return 0, 0, false, ErrBufferClosed
-		}
-		if !blocking {
-			return 0, 0, false, ErrBufferEmpty
-		}
-		a.cond.Wait()
+	if tail >= head {
+		return 0, false // Буфер пуст
 	}
 
-	// Drain fixed 16-byte header into local stack buffer
-	var hdr [HeaderSize]byte
-	n := a.ring.popUnsafe(hdr[:])
-	if n < HeaderSize {
-		return 0, 0, false, ErrCorruptFrame
-	}
+	offset := int(tail&s.mask) * s.frameSize
+	copy(dst[:s.frameSize], s.buffer[offset:offset+s.frameSize])
 
-	seq = binary.LittleEndian.Uint64(hdr[0:8])
-	ingressMonoNs := int64(binary.LittleEndian.Uint64(hdr[8:16]))
-
-	// Drain audio payload directly into caller-provided slice
-	n = a.ring.popUnsafe(outPayload[:a.payloadSize])
-	if n < a.payloadSize {
-		return 0, 0, false, ErrCorruptFrame
-	}
-
-	nowMonoNs := int64(time.Since(processOrigin))
-	latency = time.Duration(nowMonoNs - ingressMonoNs)
-
-	// Deterministic gap detection: checks against continuous expected stream progression
-	if a.streamStarted && seq != a.expectedNextSeq {
-		seqGap = true
-		a.gapsDetected.Add(1)
-	}
-	a.expectedNextSeq = seq + 1
-
-	return seq, latency, seqGap, nil
+	s.tail.Add(1)
+	return s.frameSize, true
 }
 
-// Reset flushes all buffered frames in O(1) without memory copies (crucial for barge-in / speech cut-off).
-func (a *AudioStreamBuffer) Reset() {
-	a.ring.mu.Lock()
-	defer a.ring.mu.Unlock()
-
-	_ = a.ring.discardUnsafe(a.ring.cnt)
-	a.streamStarted = false
+// Dropped возвращает число отброшенных кадров при отставании консьюмера.
+func (s *AudioStream) Dropped() uint64 {
+	return s.dropped.Load()
 }
 
-// Close unblocks waiting consumers immediately and prevents further ingestion.
-func (a *AudioStreamBuffer) Close() {
-	a.ring.mu.Lock()
-	defer a.ring.mu.Unlock()
-
-	a.closed = true
-	a.cond.Broadcast()
+// Len возвращает текущее количество кадров в буфере.
+func (s *AudioStream) Len() int {
+	head := s.head.Load()
+	tail := s.tail.Load()
+	if head < tail {
+		return 0
+	}
+	return int(head - tail)
 }
-
-// Metrics accessors: safe for concurrent inspection on any architecture
-func (a *AudioStreamBuffer) Accepted() uint64 { return a.acceptedFrames.Load() }
-func (a *AudioStreamBuffer) Dropped() uint64  { return a.droppedFrames.Load() }
-func (a *AudioStreamBuffer) Evicted() uint64  { return a.evictedFrames.Load() }
-func (a *AudioStreamBuffer) Gaps() uint64     { return a.gapsDetected.Load() }
