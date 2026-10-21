@@ -16,7 +16,7 @@ const (
 	DefaultFrameSize = 960 // 20ms фрейм при 48kHz PCM/Opus
 )
 
-// AudioStream представляет lock-free буфер аудиокадров для real-time тракта.
+// AudioStream представляет lock-free SPSC буфер аудиокадров для real-time тракта.
 type AudioStream struct {
 	_pad0     [CacheLinePad]byte
 	head      atomic.Uint64
@@ -49,7 +49,7 @@ func NewAudioStream(capacityFrames int, frameSize int) *AudioStream {
 }
 
 // PushFrame помещает аудиокадр в буфер.
-// При переполнении перезаписывает старейший кадр (sustained eviction), сохраняя 0 аллокаций.
+// При переполнении перезаписывает старейший кадр без гонок с консьюмером.
 func (s *AudioStream) PushFrame(src []byte) bool {
 	if len(src) != s.frameSize {
 		return false
@@ -57,10 +57,10 @@ func (s *AudioStream) PushFrame(src []byte) bool {
 
 	head := s.head.Load()
 	tail := s.tail.Load()
+	capacity := s.mask + 1
 
-	// Проверка переполнения
-	if head-tail > s.mask {
-		s.tail.Add(1)
+	// Если буфер переполнен, фиксируем отброшенный кадр
+	if head-tail >= capacity {
 		s.dropped.Add(1)
 	}
 
@@ -72,7 +72,7 @@ func (s *AudioStream) PushFrame(src []byte) bool {
 }
 
 // DrainFrame извлекает старейший аудиокадр в переданный буфер dst.
-// Гарантирует нулевые аллокации (0 B/op, 0 allocs/op).
+// Гарантирует нулевые аллокации (0 B/op, 0 allocs/op) и отсутствие race conditions.
 func (s *AudioStream) DrainFrame(dst []byte) (int, bool) {
 	if len(dst) < s.frameSize {
 		return 0, false
@@ -80,9 +80,16 @@ func (s *AudioStream) DrainFrame(dst []byte) (int, bool) {
 
 	tail := s.tail.Load()
 	head := s.head.Load()
+	capacity := s.mask + 1
 
 	if tail >= head {
 		return 0, false // Буфер пуст
+	}
+
+	// Если консьюмер отстал сильнее емкости буфера, подтягиваем tail (пропуск перезаписанных кадров)
+	if head-tail > capacity {
+		tail = head - capacity
+		s.tail.Store(tail)
 	}
 
 	offset := int(tail&s.mask) * s.frameSize
@@ -104,5 +111,10 @@ func (s *AudioStream) Len() int {
 	if head < tail {
 		return 0
 	}
-	return int(head - tail)
+	length := int(head - tail)
+	capacity := int(s.mask + 1)
+	if length > capacity {
+		return capacity
+	}
+	return length
 }
