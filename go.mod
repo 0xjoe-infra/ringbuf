@@ -1,4 +1,3 @@
-   module github.com/jo3di1970-lab/ringbuf
+module github.com/0xjoe-infra/ringbuf
 
-   go 1.23
-   
+go 1.23
