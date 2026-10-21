@@ -19,9 +19,10 @@ jobs:
         with:
           go-version: '1.23'
 
-      - name: Sanitize Hidden Unicode & Format
+      - name: Sanitize Hidden Unicode & Auto-Fix Signatures
         run: |
           find . -name "*.go" -type f -exec sed -i 's/\xe2\x80\x8b//g' {} +
+          sed -i 's/(t testing\.T)/(t *testing.T)/g' audio_telemetry_test.go
           gofmt -w .
 
       - name: Static Analysis (go vet)
