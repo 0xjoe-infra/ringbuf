@@ -1,3 +1,5 @@
+package ringbuf
+
 import (
 	"bytes"
 	"errors"
