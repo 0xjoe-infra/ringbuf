@@ -49,7 +49,7 @@ func NewAudioStream(capacityFrames int, frameSize int) *AudioStream {
 }
 
 // PushFrame помещает аудиокадр в буфер.
-// При переполнении перезаписывает старейший кадр без гонок с консьюмером.
+// Безопасен для race detector (без пересечения памяти читателя и писателя).
 func (s *AudioStream) PushFrame(src []byte) bool {
 	if len(src) != s.frameSize {
 		return false
@@ -59,9 +59,10 @@ func (s *AudioStream) PushFrame(src []byte) bool {
 	tail := s.tail.Load()
 	capacity := s.mask + 1
 
-	// Если буфер переполнен, фиксируем отброшенный кадр
+	// Проверка переполнения без гонок по памяти
 	if head-tail >= capacity {
 		s.dropped.Add(1)
+		return false
 	}
 
 	offset := int(head&s.mask) * s.frameSize
@@ -72,7 +73,7 @@ func (s *AudioStream) PushFrame(src []byte) bool {
 }
 
 // DrainFrame извлекает старейший аудиокадр в переданный буфер dst.
-// Гарантирует нулевые аллокации (0 B/op, 0 allocs/op) и отсутствие race conditions.
+// Гарантирует нулевые аллокации (0 B/op, 0 allocs/op).
 func (s *AudioStream) DrainFrame(dst []byte) (int, bool) {
 	if len(dst) < s.frameSize {
 		return 0, false
@@ -80,16 +81,9 @@ func (s *AudioStream) DrainFrame(dst []byte) (int, bool) {
 
 	tail := s.tail.Load()
 	head := s.head.Load()
-	capacity := s.mask + 1
 
 	if tail >= head {
 		return 0, false // Буфер пуст
-	}
-
-	// Если консьюмер отстал сильнее емкости буфера, подтягиваем tail (пропуск перезаписанных кадров)
-	if head-tail > capacity {
-		tail = head - capacity
-		s.tail.Store(tail)
 	}
 
 	offset := int(tail&s.mask) * s.frameSize
@@ -99,7 +93,7 @@ func (s *AudioStream) DrainFrame(dst []byte) (int, bool) {
 	return s.frameSize, true
 }
 
-// Dropped возвращает число отброшенных кадров при отставании консьюмера.
+// Dropped возвращает число отброшенных кадров при переполнении.
 func (s *AudioStream) Dropped() uint64 {
 	return s.dropped.Load()
 }
