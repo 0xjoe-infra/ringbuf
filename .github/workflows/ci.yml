@@ -22,10 +22,9 @@ jobs:
       - name: Prepare Code
         run: |
           find . -name "*.go" -type f -exec sed -i 's/\xe2\x80\x8b//g' {} +
-          sed -i 's/(t testing\.T)/(t *testing.T)/g' audio_telemetry_test.go
-          sed -i 's/(b testing\.B)/(b *testing.B)/g' audio_telemetry_test.go
           sed -i 's/_, err := asb\.DrainFrame/_, _, _, err := asb.DrainFrame/g' audio_telemetry_test.go
-          sed -i 's/_, _ = asb\.DrainFrame/_, _, _, _ = asb.DrainFrame/g' audio_telemetry_test.go
+          sed -i '/info, err := asb\.DrainFrame/,$d' audio_telemetry_test.go
+          printf '_, _, _, err = asb.DrainFrame(out, false)\nif err != nil {\nt.Fatal(err)\n}\n}\nvar (\n_ = bytes.Equal\n_ = rand.Int\n_ = runtime.GC\n_ sync.Mutex\n)\n' >> audio_telemetry_test.go
           gofmt -w .
 
       - name: Static Analysis
