@@ -1,112 +1,87 @@
 package ringbuf
-​import (
-"errors"
-"fmt"
-"sync"
+import (
+	"sync/atomic"
 )
-​var (
-ErrBufferFull  = errors.New("ringbuf: buffer is full")
-ErrBufferEmpty = errors.New("ringbuf: buffer is empty")
-ErrInvalidSize = errors.New("ringbuf: buffer size must be greater than zero")
-)
-​type RingBuffer struct {
-buf  []byte
-size int
-head int
-tail int
-cnt  int
-mu   sync.Mutex
+
+// RingBuffer реализует lock-free SPSC кольцевой буфер фиксированной емкости.
+type RingBuffer struct {
+	_pad0 [CacheLinePad]byte
+	head  atomic.Uint64
+	_pad1 [CacheLinePad]byte
+	tail  atomic.Uint64
+	_pad2 [CacheLinePad]byte
+	mask  uint64
+	buf   []byte
+	_pad3 [CacheLinePad]byte
 }
-​func New(size int) (*RingBuffer, error) {
-if size <= 0 {
-return nil, fmt.Errorf("%w: got %d", ErrInvalidSize, size)
+
+// New создает новый RingBuffer с размером, округленным до степени двойки.
+func New(size int) *RingBuffer {
+	if size < 2 {
+		size = 2
+	}
+	cap := 1
+	for cap < size {
+		cap <<= 1
+	}
+	return &RingBuffer{
+		mask: uint64(cap - 1),
+		buf:  make([]byte, cap),
+	}
 }
-return &RingBuffer{
-buf:  make([]byte, size),
-size: size,
-}, nil
+
+// Write записывает срез байтов в буфер без аллокаций.
+func (r *RingBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if n == 0 {
+		return 0, nil
+	}
+	head := r.head.Load()
+	tail := r.tail.Load()
+	free := int(r.mask+1) - int(head-tail)
+	if n > free {
+		return 0, ErrBufferFull
+	}
+	for i := 0; i < n; i++ {
+		r.buf[(head+uint64(i))&r.mask] = p[i]
+	}
+	r.head.Add(uint64(n))
+	return n, nil
 }
-​func (r *RingBuffer) Push(p []byte) (int, error) {
-r.mu.Lock()
-defer r.mu.Unlock()
-​n := len(p)
-if n == 0 {
-return 0, nil
+
+// Read читает доступные байты из буфера в предоставленный срез p.
+func (r *RingBuffer) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	tail := r.tail.Load()
+	head := r.head.Load()
+	avail := int(head - tail)
+	if avail <= 0 {
+		return 0, ErrBufferEmpty
+	}
+	n := len(p)
+	if n > avail {
+		n = avail
+	}
+	for i := 0; i < n; i++ {
+		p[i] = r.buf[(tail+uint64(i))&r.mask]
+	}
+	r.tail.Add(uint64(n))
+	return n, nil
 }
-if n > r.size-r.cnt {
-return 0, ErrBufferFull
+
+// Len возвращает количество байтов, ожидающих чтения.
+func (r *RingBuffer) Len() int {
+	head := r.head.Load()
+	tail := r.tail.Load()
+	if head < tail {
+		return 0
+	}
+	return int(head - tail)
 }
-return r.pushUnsafe(p), nil
-}
-​func (r *RingBuffer) Pop(p []byte) (int, error) {
-r.mu.Lock()
-defer r.mu.Unlock()
-​if r.cnt == 0 {
-return 0, ErrBufferEmpty
-}
-return r.popUnsafe(p), nil
-}
-​func (r *RingBuffer) pushUnsafe(p []byte) int {
-n := min(len(p), r.size-r.cnt)
-if n == 0 {
-return 0
-}
-​firstChunk := min(n, r.size-r.tail)
-copy(r.buf[r.tail:r.tail+firstChunk], p[:firstChunk])
-​if remaining := n - firstChunk; remaining > 0 {
-copy(r.buf[:remaining], p[firstChunk:])
-r.tail = remaining
-} else {
-r.tail = (r.tail + firstChunk) % r.size
-}
-​r.cnt += n
-return n
-}
-​func (r *RingBuffer) pushFrameUnsafe(header []byte, payload []byte) bool {
-total := len(header) + len(payload)
-if total > r.size-r.cnt {
-return false
-}
-if r.pushUnsafe(header) != len(header) {
-panic("ringbuf: invariant broken on atomic header push")
-}
-if r.pushUnsafe(payload) != len(payload) {
-panic("ringbuf: invariant broken on atomic payload push")
-}
-return true
-}
-​func (r *RingBuffer) popUnsafe(p []byte) int {
-n := min(len(p), r.cnt)
-if n == 0 {
-return 0
-}
-​firstChunk := min(n, r.size-r.head)
-copy(p[:firstChunk], r.buf[r.head:r.head+firstChunk])
-​if remaining := n - firstChunk; remaining > 0 {
-copy(p[firstChunk:n], r.buf[:remaining])
-r.head = remaining
-} else {
-r.head = (r.head + firstChunk) % r.size
-}
-​r.cnt -= n
-return n
-}
-​func (r *RingBuffer) discardUnsafe(n int) int {
-toDiscard := min(n, r.cnt)
-if toDiscard == 0 {
-return 0
-}
-​r.head = (r.head + toDiscard) % r.size
-r.cnt -= toDiscard
-return toDiscard
-}
-​func (r *RingBuffer) Available() int {
-r.mu.Lock()
-defer r.mu.Unlock()
-return r.size - r.cnt
-}
-​func (r *RingBuffer) Length() int {
-r.mu.Lock()
-defer r.mu.Unlock()
-return r.cnt
+
+// Cap возвращает полную емкость кольцевого буфера.
+func (r *RingBuffer) Cap() int {
+	return len(r.buf)
 }
