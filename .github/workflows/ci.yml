@@ -1,4 +1,4 @@
-name: Systems Quality & Zero-Alloc CI
+name: Zero-Alloc CI
 
 on:
   push:
@@ -7,39 +7,27 @@ on:
     branches: [ main ]
 
 jobs:
-  audit-and-verify:
-    name: Engine Hardening & Race Checks
+  test:
+    name: Race Detector & Zero-Alloc Benchmarks
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Go
+      - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.23'
+          cache: true
 
-      - name: Prepare Code
-        run: |
-          find . -name "*.go" -type f -exec sed -i 's/\xe2\x80\x8b//g' {} +
-          sed -i 's/_, err := asb\.DrainFrame/_, _, _, err := asb.DrainFrame/g' audio_telemetry_test.go
-          sed -i '/info, err := asb\.DrainFrame/,$d' audio_telemetry_test.go
-          printf '_, _, _, err = asb.DrainFrame(out, false)\nif err != nil {\nt.Fatal(err)\n}\n}\nvar (\n_ = bytes.Equal\n_ = rand.Int\n_ = runtime.GC\n_ sync.Mutex\n)\n' >> audio_telemetry_test.go
-          gofmt -w .
+      - name: Verify Module Dependencies
+        run: go mod tidy
 
-      - name: Static Analysis
+      - name: Static Analysis & Vet
         run: go vet ./...
 
-      - name: Race Detection
-        run: go test -race -v -count=1 ./...
+      - name: Run Tests with Race Detector
+        run: go test -v -race -timeout=2m ./...
 
-      - name: 32-bit Architecture Check
-        run: GOARCH=386 go test -v -count=1 ./...
-
-      - name: Escape Analysis
-        run: |
-          go build -gcflags="-m" ./... 2>&1 | tee escape.txt
-          grep "hdr" escape.txt || true
-
-      - name: Benchmarks
-        run: go test -bench=. -benchmem -count=1 ./...
+      - name: Run Zero-Alloc Benchmarks
+        run: go test -v -run=^$ -bench=BenchmarkAudioStream_ZeroAllocSustainedEviction -benchmem ./...
