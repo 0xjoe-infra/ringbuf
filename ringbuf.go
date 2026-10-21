@@ -62,9 +62,7 @@ r.tail = (r.tail + firstChunk) % r.size
 ​r.cnt += n
 return n
 }
-​// pushFrameUnsafe guarantees all-or-nothing insertion for multiple contiguous chunks
-// (e.g. fixed header + payload) under an already-held lock, eliminating partial writes by design.
-func (r *RingBuffer) pushFrameUnsafe(header []byte, payload []byte) bool {
+​func (r *RingBuffer) pushFrameUnsafe(header []byte, payload []byte) bool {
 total := len(header) + len(payload)
 if total > r.size-r.cnt {
 return false
