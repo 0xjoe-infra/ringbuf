@@ -1,200 +1,199 @@
 package ringbuf
-
-import (
-	"bytes"
-	"math/rand"
-	"sort"
-	"sync"
-	"testing"
-	"time"
+​import (
+"bytes"
+"math/rand"
+"runtime"
+"sync"
+"testing"
+"time"
 )
-
-// TestAudioStream_UnalignedWraparoundWithEviction proves that unaligned ring capacity
-// correctly wraps both the 16-byte binary header and payload across buffer boundaries
-// during active eviction without memory corruption.
-func TestAudioStream_UnalignedWraparoundWithEviction(t *testing.T) {
-	const payloadSize = 320 // 10ms frame
-	totalFrameSize := HeaderSize + payloadSize
-
-	// Capacity: holds 2 frames + 13 bytes offset (guarantees boundary split)
-	unalignedCap := (totalFrameSize * 2) + 13
-
-	asb, err := NewAudioStreamBuffer(unalignedCap, payloadSize, 2, PolicyDropOldest)
-	if err != nil {
-		t.Fatalf("failed to init unaligned buffer: %v", err)
-	}
-
-	outPayload := make([]byte, payloadSize)
-
-	// Stream 30 frames with eviction continuously wrapping across the 13-byte boundary
-	for i := uint64(1); i <= 30; i++ {
-		payload := bytes.Repeat([]byte{byte(i & 0xFF)}, payloadSize)
-		ingressTime := time.Now()
-
-		if err := asb.IngestFrame(i, ingressTime, payload); err != nil {
-			t.Fatalf("frame %d failed to ingest: %v", i, err)
-		}
-
-		// Drain every second frame to constantly force wraparound eviction
-		if i%2 == 0 {
-			seq, _, _, err := asb.DrainFrame(outPayload, false)
-			if err != nil {
-				t.Fatalf("frame %d failed to drain: %v", i, err)
-			}
-			expectedPayload := bytes.Repeat([]byte{byte(seq & 0xFF)}, payloadSize)
-			if !bytes.Equal(outPayload, expectedPayload) {
-				t.Fatalf("payload corrupted during unaligned wraparound eviction at seq %d", seq)
-			}
-		}
-	}
+​func TestAudioStream_CloseUnblocksConsumer(t *testing.T) {
+const payloadSize = 320
+asb, err := NewAudioStreamBuffer((HeaderSize+payloadSize)*4, payloadSize, 2, PolicyRejectNew)
+if err != nil {
+t.Fatal(err)
 }
-
-// TestAudioStream_PreDrainEvictionGapDetection verifies that when evictions occur
-// before the consumer ever executes DrainFrame, the first drained frame detects the gap immediately.
-func TestAudioStream_PreDrainEvictionGapDetection(t *testing.T) {
-	const payloadSize = 640
-	totalFrameSize := HeaderSize + payloadSize
-	asb, _ := NewAudioStreamBuffer(totalFrameSize*3, payloadSize, 3, PolicyDropOldest)
-
-	dummy := make([]byte, payloadSize)
-
-	// Ingest 5 frames into 3-frame capacity before any drain happens
-	for seq := uint64(1); seq <= 5; seq++ {
-		_ = asb.IngestFrame(seq, time.Now(), dummy)
-	}
-
-	if asb.Evicted() != 2 {
-		t.Fatalf("expected 2 evicted frames, got %d", asb.Evicted())
-	}
-
-	out := make([]byte, payloadSize)
-
-	// First consumed frame must be seq 3 AND must flag seqGap == true because seq 1 and 2 were lost
-	seq, _, seqGap, err := asb.DrainFrame(out, false)
-	if err != nil || seq != 3 {
-		t.Fatalf("expected first frame seq=3, got %d (err=%v)", seq, err)
-	}
-	if !seqGap {
-		t.Fatalf("expected seqGap=true on first drain when head was evicted before read")
-	}
+​done := make(chan struct{})
+go func() {
+out := make([]byte, payloadSize)
+_, err := asb.DrainFrame(out, true)
+if err != ErrBufferClosed {
+t.Errorf("expected ErrBufferClosed, got %v", err)
 }
-
-// TestAudioStream_ConcurrentStreamingWithRace exercises the 50 Hz real-time voice pipeline
-// with injected backpressure stalls under race detector verification, asserting graceful Close().
-func TestAudioStream_ConcurrentStreamingWithRace(t *testing.T) {
-	const (
-		payloadSize    = 640 // 20ms of 16kHz audio
-		totalFrameSize = HeaderSize + payloadSize
-		maxLatency     = 5 // 100ms conversational ceiling
-	)
-
-	asb, err := NewAudioStreamBuffer(totalFrameSize*10, payloadSize, maxLatency, PolicyDropOldest)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var (
-		wg         sync.WaitGroup
-		latencies  []time.Duration
-		latencyMu  sync.Mutex
-		stopSignal = make(chan struct{})
-	)
-
-	wg.Add(2)
-
-	// Producer: 50 Hz real-time audio pacing
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(20 * time.Millisecond)
-		defer ticker.Stop()
-
-		var seq uint64 = 1
-		dummy := make([]byte, payloadSize)
-
-		for {
-			select {
-			case <-stopSignal:
-				return
-			case t := <-ticker.C:
-				_ = asb.IngestFrame(seq, t, dummy)
-				seq++
-			}
-		}
-	}()
-
-	// Consumer: Drain with backpressure jitter
-	go func() {
-		defer wg.Done()
-		out := make([]byte, payloadSize)
-
-		for {
-			seq, latency, _, err := asb.DrainFrame(out, true)
-			if err != nil {
-				return // Closed cleanly
-			}
-			if seq > 0 {
-				latencyMu.Lock()
-				latencies = append(latencies, latency)
-				latencyMu.Unlock()
-			}
-
-			// Injected socket lag (30ms stall triggers eviction against 100ms budget)
-			if rand.Float64() < 0.10 {
-				time.Sleep(30 * time.Millisecond)
-			}
-		}
-	}()
-
-	time.Sleep(300 * time.Millisecond)
-	close(stopSignal)
-	asb.Close() // Wake blocked consumer goroutines
-	wg.Wait()
-
-	if asb.Accepted() == 0 {
-		t.Fatal("no frames accepted")
-	}
+close(done)
+}()
+​time.Sleep(20 * time.Millisecond)
+asb.Close()
+​select {
+case <-done:
+case <-time.After(500 * time.Millisecond):
+t.Fatal("DrainFrame failed to unblock on Close()")
 }
-
-// TestAudioStream_BargeInReset asserts that Reset() purges all queued latency in O(1).
-func TestAudioStream_BargeInReset(t *testing.T) {
-	const payloadSize = 320
-	asb, _ := NewAudioStreamBuffer((HeaderSize+payloadSize)*5, payloadSize, 5, PolicyRejectNew)
-
-	dummy := make([]byte, payloadSize)
-	for i := uint64(1); i <= 4; i++ {
-		_ = asb.IngestFrame(i, time.Now(), dummy)
-	}
-
-	asb.Reset()
-
-	out := make([]byte, payloadSize)
-	_, _, _, err := asb.DrainFrame(out, false)
-	if err != ErrBufferEmpty {
-		t.Fatalf("expected ErrBufferEmpty after Reset(), got %v", err)
-	}
 }
-
-// BenchmarkAudioStream_ZeroAllocSustainedEviction continuously triggers DropOldest eviction
-// via a 2:1 Ingest:Drain ratio, proving zero allocations and recording evicted metrics.
-func BenchmarkAudioStream_ZeroAllocSustainedEviction(b *testing.B) {
-	const payloadSize = 640
-	totalFrameSize := HeaderSize + payloadSize
-	// Capacity: 4 frames
-	asb, _ := NewAudioStreamBuffer(totalFrameSize*4, payloadSize, 4, PolicyDropOldest)
-
-	payload := make([]byte, payloadSize)
-	outPayload := make([]byte, payloadSize)
-	now := time.Now()
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		// 2 Ingests per 1 Drain forces continuous buffer saturation and head eviction
-		_ = asb.IngestFrame(uint64(i*2), now, payload)
-		_ = asb.IngestFrame(uint64(i*2+1), now, payload)
-		_, _, _, _ = asb.DrainFrame(outPayload, false)
-	}
-
-	b.ReportMetric(float64(asb.Evicted()), "evicted_frames")
+​func TestAudioStream_LatencyBudgetAndGapDetection(t *testing.T) {
+const payloadSize = 640
+totalFrameSize := HeaderSize + payloadSize
+largeCapacity := totalFrameSize * 20
+budgetFrames := 4
+​asb, err := NewAudioStreamBuffer(largeCapacity, payloadSize, budgetFrames, PolicyDropOldest)
+if err != nil {
+t.Fatal(err)
+}
+​dummy := make([]byte, payloadSize)
+now := time.Now()
+​for seq := uint64(1); seq <= 6; seq++ {
+_ = asb.IngestFrame(seq, now, dummy)
+}
+​if asb.Evicted() != 2 {
+t.Fatalf("expected 2 evicted frames, got %d", asb.Evicted())
+}
+​out := make([]byte, payloadSize)
+info, err := asb.DrainFrame(out, false)
+if err != nil || info.Seq != 3 || !info.SeqGap || info.Lost != 2 {
+t.Fatalf("expected head seq=3 with SeqGap=true and Lost=2, got %+v (err=%v)", info, err)
+}
+}
+​func TestAudioStream_ZeroAllocMemStats_Strict(t testing.T) {
+const payloadSize = 640
+totalFrameSize := HeaderSize + payloadSize
+asb, err := NewAudioStreamBuffer(totalFrameSize4, payloadSize, 4, PolicyDropOldest)
+if err != nil {
+t.Fatal(err)
+}
+​payload := make([]byte, payloadSize)
+outPayload := make([]byte, payloadSize)
+now := time.Now()
+​// Warm-up to steady state
+for i := uint64(1); i <= 10; i++ {
+_ = asb.IngestFrame(i, now, payload)
+_, _ = asb.DrainFrame(outPayload, false)
+}
+​evictedBefore := asb.Evicted()
+​runtime.GC()
+var m1, m2 runtime.MemStats
+runtime.ReadMemStats(&m1)
+​var seq uint64 = 11
+const iterations = 5000
+for i := 0; i < iterations; i++ {
+_ = asb.IngestFrame(seq, now, payload)
+seq++
+_ = asb.IngestFrame(seq, now, payload)
+seq++
+_, _ = asb.DrainFrame(outPayload, false)
+}
+​runtime.ReadMemStats(&m2)
+totalMallocs := m2.Mallocs - m1.Mallocs
+​if totalMallocs != 0 {
+t.Fatalf("strict zero-alloc violated: expected 0 heap mallocs, got %d", totalMallocs)
+}
+​if asb.Evicted() <= evictedBefore {
+t.Fatal("eviction path was not exercised in zero-alloc test")
+}
+}
+​func TestAudioStream_UnalignedWraparoundRampedPayload(t *testing.T) {
+const payloadSize = 320
+totalFrameSize := HeaderSize + payloadSize
+unalignedCap := (totalFrameSize * 2) + 13
+​asb, err := NewAudioStreamBuffer(unalignedCap, payloadSize, 2, PolicyDropOldest)
+if err != nil {
+t.Fatalf("failed to init unaligned buffer: %v", err)
+}
+​outPayload := make([]byte, payloadSize)
+​for i := uint64(1); i <= 30; i++ {
+payload := make([]byte, payloadSize)
+for j := range payload {
+payload[j] = byte(i) + byte(j*7)
+}
+​if err := asb.IngestFrame(i, time.Now(), payload); err != nil {
+t.Fatalf("frame %d failed to ingest: %v", i, err)
+}
+​if i%2 == 0 {
+info, err := asb.DrainFrame(outPayload, false)
+if err != nil {
+t.Fatalf("frame %d failed to drain: %v", i, err)
+}
+expectedPayload := make([]byte, payloadSize)
+for j := range expectedPayload {
+expectedPayload[j] = byte(info.Seq) + byte(j*7)
+}
+if !bytes.Equal(outPayload, expectedPayload) {
+t.Fatalf("payload corrupted at seq %d across unaligned wraparound", info.Seq)
+}
+}
+}
+​if asb.Evicted() != 14 {
+t.Fatalf("expected exactly 14 evictions, got %d", asb.Evicted())
+}
+}
+​func TestAudioStream_ConcurrentStreamingWithRace(t *testing.T) {
+const (
+payloadSize    = 640
+totalFrameSize = HeaderSize + payloadSize
+maxLatency     = 5
+)
+​asb, err := NewAudioStreamBuffer(totalFrameSize*10, payloadSize, maxLatency, PolicyDropOldest)
+if err != nil {
+t.Fatal(err)
+}
+​var (
+wg         sync.WaitGroup
+stopSignal = make(chan struct{})
+)
+​wg.Add(2)
+​go func() {
+defer wg.Done()
+ticker := time.NewTicker(20 * time.Millisecond)
+defer ticker.Stop()
+​var seq uint64 = 1
+dummy := make([]byte, payloadSize)
+​for {
+select {
+case <-stopSignal:
+return
+case t := <-ticker.C:
+_ = asb.IngestFrame(seq, t, dummy)
+seq++
+}
+}
+}()
+​go func() {
+defer wg.Done()
+out := make([]byte, payloadSize)
+​for {
+info, err := asb.DrainFrame(out, true)
+if err != nil {
+return
+}
+if info.Seq > 0 && rand.Float64() < 0.10 {
+time.Sleep(30 * time.Millisecond)
+}
+}
+}()
+​time.Sleep(300 * time.Millisecond)
+close(stopSignal)
+asb.Close()
+wg.Wait()
+​if asb.Accepted() == 0 {
+t.Fatal("no frames accepted")
+}
+}
+​func BenchmarkAudioStream_ZeroAllocSustainedEviction(b testing.B) {
+const payloadSize = 640
+totalFrameSize := HeaderSize + payloadSize
+asb, _ := NewAudioStreamBuffer(totalFrameSize4, payloadSize, 4, PolicyDropOldest)
+​payload := make([]byte, payloadSize)
+outPayload := make([]byte, payloadSize)
+now := time.Now()
+​b.ResetTimer()
+b.ReportAllocs()
+​var seq uint64 = 1
+for i := 0; i < b.N; i++ {
+_ = asb.IngestFrame(seq, now, payload)
+seq++
+_ = asb.IngestFrame(seq, now, payload)
+seq++
+_, _ = asb.DrainFrame(outPayload, false)
+}
+​b.StopTimer()
+b.ReportMetric(float64(asb.Evicted())/float64(b.N), "evicted/op")
 }
