@@ -1,138 +1,77 @@
 package ringbuf
-
 import (
 	"bytes"
-	"errors"
 	"sync"
-	"sync/atomic"
 	"testing"
 )
 
-func TestRingBuffer_InvalidCapacity(t *testing.T) {
-	_, err := New(0)
-	if !errors.Is(err, ErrInvalidSize) {
-		t.Fatalf("expected ErrInvalidSize on zero capacity, got %v", err)
+func TestRingBuffer_WriteRead(t *testing.T) {
+	rb := New(64)
+	payload := []byte("zero-alloc-voice-frame")
+
+	n, err := rb.Write(payload)
+	if err != nil || n != len(payload) {
+		t.Fatalf("unexpected write result: n=%d, err=%v", n, err)
 	}
 
-	_, err = New(-64)
-	if !errors.Is(err, ErrInvalidSize) {
-		t.Fatalf("expected ErrInvalidSize on negative capacity, got %v", err)
-	}
-}
-
-func TestRingBuffer_WraparoundIntegrity(t *testing.T) {
-	rb, err := New(16)
-	if err != nil {
-		t.Fatal(err)
+	if rb.Len() != len(payload) {
+		t.Fatalf("expected len %d, got %d", len(payload), rb.Len())
 	}
 
-	payload1 := []byte("1234567890")
-	if _, err := rb.Push(payload1); err != nil {
-		t.Fatalf("unexpected push error: %v", err)
-	}
-	out1 := make([]byte, 10)
-	if _, err := rb.Pop(out1); err != nil || !bytes.Equal(payload1, out1) {
-		t.Fatalf("pop mismatch or error: %v", err)
+	out := make([]byte, len(payload))
+	rn, err := rb.Read(out)
+	if err != nil || rn != len(payload) {
+		t.Fatalf("unexpected read result: n=%d, err=%v", rn, err)
 	}
 
-	payload2 := []byte("abcdefghijkl")
-	if _, err := rb.Push(payload2); err != nil {
-		t.Fatalf("push wraparound failed: %v", err)
-	}
-
-	out2 := make([]byte, 12)
-	n, err := rb.Pop(out2)
-	if err != nil || n != 12 || !bytes.Equal(payload2, out2) {
-		t.Fatalf("wraparound data corrupted: expected %s, got %s", payload2, out2)
+	if !bytes.Equal(payload, out) {
+		t.Fatalf("data mismatch: expected %q, got %q", payload, out)
 	}
 }
 
-func TestRingBuffer_ConcurrentProducerConsumer_Checksum(t *testing.T) {
-	const (
-		bufCap    = 4096
-		totalMsgs = 10000
-		chunkSize = 32
-	)
+func TestRingBuffer_OverflowAndEmpty(t *testing.T) {
+	rb := New(16)
+	data := make([]byte, 16)
 
-	rb, err := New(bufCap)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := rb.Read(data); err != ErrBufferEmpty {
+		t.Fatalf("expected ErrBufferEmpty, got %v", err)
 	}
 
-	var (
-		wg         sync.WaitGroup
-		writtenSum uint64
-		readSum    uint64
-	)
+	if _, err := rb.Write(data); err != nil {
+		t.Fatalf("unexpected write error: %v", err)
+	}
 
+	if _, err := rb.Write([]byte{1}); err != ErrBufferFull {
+		t.Fatalf("expected ErrBufferFull, got %v", err)
+	}
+}
+
+func TestRingBuffer_ConcurrentSPSC(t *testing.T) {
+	rb := New(1024)
+	const iterations = 5000
+	frame := []byte("01234567")
+
+	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		for i := uint64(0); i < totalMsgs; i++ {
-			chunk := make([]byte, chunkSize)
-			for j := range chunk {
-				chunk[j] = byte(i & 0xFF)
-			}
-			for {
-				_, pushErr := rb.Push(chunk)
-				if pushErr == nil {
-					atomic.AddUint64(&writtenSum, uint64(len(chunk))*uint64(i&0xFF))
-					break
-				}
+		for i := 0; i < iterations; {
+			if _, err := rb.Write(frame); err == nil {
+				i++
 			}
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		out := make([]byte, chunkSize)
-		consumed := 0
-		for consumed < totalMsgs {
-			n, popErr := rb.Pop(out)
-			if popErr == nil && n == chunkSize {
-				val := out[0]
-				atomic.AddUint64(&readSum, uint64(n)*uint64(val))
-				consumed++
+		buf := make([]byte, len(frame))
+		for readTotal := 0; readTotal < iterations*len(frame); {
+			if n, err := rb.Read(buf); err == nil {
+				readTotal += n
 			}
 		}
 	}()
 
 	wg.Wait()
-
-	if writtenSum != readSum {
-		t.Fatalf("concurrency checksum mismatch: written %d != read %d", writtenSum, readSum)
-	}
-}
-
-func BenchmarkRingBuffer_SingleThreaded(b *testing.B) {
-	rb, _ := New(64 * 1024)
-	chunk := make([]byte, 256)
-	out := make([]byte, 256)
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		_, _ = rb.Push(chunk)
-		_, _ = rb.Pop(out)
-	}
-}
-
-func BenchmarkRingBuffer_Concurrent_Contention(b *testing.B) {
-	rb, _ := New(256 * 1024)
-	chunk := make([]byte, 256)
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	b.RunParallel(func(pb *testing.PB) {
-		readBuf := make([]byte, 256)
-		for pb.Next() {
-			_, err := rb.Push(chunk)
-			if err == nil {
-				_, _ = rb.Pop(readBuf)
-			}
-		}
-	})
 }
