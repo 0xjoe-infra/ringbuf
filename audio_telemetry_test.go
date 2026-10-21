@@ -1,5 +1,4 @@
 package ringbuf
-
 import (
 	"sync"
 	"testing"
@@ -11,12 +10,10 @@ func TestAudioStream_ConcurrentPushDrain(t *testing.T) {
 		frameSize = 960
 		totalOps  = 10000
 	)
-
 	stream := NewAudioStream(capacity, frameSize)
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Producer
 	go func() {
 		defer wg.Done()
 		src := make([]byte, frameSize)
@@ -26,7 +23,6 @@ func TestAudioStream_ConcurrentPushDrain(t *testing.T) {
 		}
 	}()
 
-	// Consumer
 	go func() {
 		defer wg.Done()
 		dst := make([]byte, frameSize)
@@ -52,7 +48,6 @@ func BenchmarkAudioStream_ZeroAllocSustainedEviction(b *testing.B) {
 		capacity  = 128
 		frameSize = 960
 	)
-
 	stream := NewAudioStream(capacity, frameSize)
 	src := make([]byte, frameSize)
 	dst := make([]byte, frameSize)
