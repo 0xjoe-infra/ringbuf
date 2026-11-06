@@ -1,10 +1,5 @@
 # 0XJOE-INFRA // ringbuf
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/0xjoe-infra/ringbuf.svg)](https://pkg.go.dev/github.com/0xjoe-infra/ringbuf)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Zero-Allocation](https://img.shields.io/badge/Memory-Zero--Alloc-brightgreen.svg)]()
-[![Mechanical Sympathy](https://img.shields.io/badge/CPU-128B%20Aligned-orange.svg)]()
-
 Production-grade, lock-free **Single-Producer Single-Consumer (SPSC)** bounded circular byte buffer in Go, engineered for sub-millisecond queuing, LLM token streaming pipelines, and low-latency FinTech telemetry.
 
 ---
@@ -20,29 +15,10 @@ Production-grade, lock-free **Single-Producer Single-Consumer (SPSC)** bounded c
 
 ---
 
-## Memory Layout
-
-+-------------------------------------------------------------+
-| [128B Pad]                                                  |
-+-------------------------------------------------------------+
-| PRODUCER CORE LINE: head (atomic.Uint64) | cachedTail       |
-+-------------------------------------------------------------+
-| [128B Pad]                                                  |
-+-------------------------------------------------------------+
-| CONSUMER CORE LINE: tail (atomic.Uint64) | cachedHead       |
-+-------------------------------------------------------------+
-| [128B Pad]                                                  |
-+-------------------------------------------------------------+
-| READ-ONLY CONFIG:   mask (uint64) | buf ([]byte)            |
-+-------------------------------------------------------------+
-
----
-
 ## Installation
 
 ```bash
 go get -u [github.com/0xjoe-infra/ringbuf](https://github.com/0xjoe-infra/ringbuf)
-Quickstart
 package main
 
 import (
@@ -53,16 +29,13 @@ import (
 )
 
 func main() {
-	// Capacity rounds up to the next power of two (1024)
 	rb := ringbuf.New(1000)
 
-	// Producer routine
 	payload := []byte("0XJOE-INFRA :: high-throughput event payload")
 	if _, err := rb.Write(payload); err != nil {
 		log.Fatalf("write error: %v", err)
 	}
 
-	// Consumer routine
 	out := make([]byte, 128)
 	n, err := rb.Read(out)
 	if err != nil {
@@ -71,16 +44,9 @@ func main() {
 
 	fmt.Printf("Received %d bytes: %s\n", n, string(out[:n]))
 }
-Benchmarks
-​Benchmarked on Apple M-series / AMD EPYC (SPSC pinned execution, dedicated goroutines):
-go test -bench=. -benchmem -race
-
 BenchmarkRingBuffer_Throughput/Batch_64B-8        50000000    18.4 ns/op    3478.26 MB/s    0 B/op    0 allocs/op
 BenchmarkRingBuffer_Throughput/Batch_1KB-8        24000000    42.1 ns/op   24323.04 MB/s    0 B/op    0 allocs/op
 BenchmarkRingBuffer_Latency_P99-8                 --          0.016 ms     --              0 B/op    0 allocs/op
 PASS
-Verification & Safety
-​Fully verified under Go race detector: go test -race ./... passes cleanly without warnings.
-​Concurrency boundary invariants validated under sustained cross-core stress.
 License
-​MIT License (c) 2026 0XJOE-INFRA. Developed as part of high-throughput systems infrastructure.
+​MIT License (c) 2026 0XJOE-INFRA.
