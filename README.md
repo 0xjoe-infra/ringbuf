@@ -18,14 +18,14 @@ Production-grade, lock-free **Single-Producer Single-Consumer (SPSC)** bounded c
 ## Installation
 
 ```bash
-go get -u [github.com/0xjoe-infra/ringbuf](https://github.com/0xjoe-infra/ringbuf)
+go get -u github.com/0xjoe-infra/ringbuf
 package main
 
 import (
 	"fmt"
 	"log"
 
-	"[github.com/0xjoe-infra/ringbuf](https://github.com/0xjoe-infra/ringbuf)"
+	"github.com/0xjoe-infra/ringbuf"
 )
 
 func main() {
@@ -48,5 +48,4 @@ BenchmarkRingBuffer_Throughput/Batch_64B-8        50000000    18.4 ns/op    3478
 BenchmarkRingBuffer_Throughput/Batch_1KB-8        24000000    42.1 ns/op   24323.04 MB/s    0 B/op    0 allocs/op
 BenchmarkRingBuffer_Latency_P99-8                 --          0.016 ms     --              0 B/op    0 allocs/op
 PASS
-License
-​MIT License (c) 2026 0XJOE-INFRA.
+MIT License (c) 2026 0XJOE-INFRA.
