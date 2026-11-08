@@ -1,14 +1,7 @@
 package ringbuf
 
 import (
-	"errors"
 	"sync/atomic"
-)
-
-var (
-	ErrBufferFull   = errors.New("ringbuf: buffer full")
-	ErrBufferEmpty  = errors.New("ringbuf: buffer empty")
-	ErrDstTooSmall  = errors.New("ringbuf: destination slice too small")
 )
 
 const (
@@ -17,17 +10,17 @@ const (
 
 // AudioStream представляет lock-free SPSC буфер аудиокадров для real-time стриминга.
 type AudioStream struct {
-	_pad0      [CacheLinePad]byte
-	head       atomic.Uint64
-	_pad1      [CacheLinePad]byte
-	tail       atomic.Uint64
-	_pad2      [CacheLinePad]byte
-	dropped    atomic.Uint64
-	_pad3      [CacheLinePad]byte
-	mask       uint64
-	frameSize  int
-	buffer     []byte
-	_pad4      [CacheLinePad]byte
+	_pad0     [CacheLinePad]byte
+	head      atomic.Uint64
+	_pad1     [CacheLinePad]byte
+	tail      atomic.Uint64
+	_pad2     [CacheLinePad]byte
+	dropped   atomic.Uint64
+	_pad3     [CacheLinePad]byte
+	mask      uint64
+	frameSize int
+	buffer    []byte
+	_pad4     [CacheLinePad]byte
 }
 
 // NewAudioStream создает буфер заданной емкости кадров (округляется вверх до степени двойки).
